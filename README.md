@@ -16,6 +16,8 @@ This repository contains an implementation of _Conformal Credal Self-Supervised 
 }
 ```
 
+The papers' **appendix** for COPA 2023 can be found separately here: [CCSSL_Appendix.pdf](CCSSL_Appendix.pdf)
+
 ## Foreword
 
 Our implementation re-uses parts of an unofficial PyTorch implementation of FixMatch [1], namely from [this repository](https://github.com/kekmodel/FixMatch-pytorch) (MIT License). Thus, we overtake large parts of their code, for which we gratefully thank the authors for their work. While some parts were added from scratch (e.g., the conformal prediction implementation), we also augmented existing code (e.g., the data loaders by adding a calibration split).
