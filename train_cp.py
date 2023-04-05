@@ -1,7 +1,10 @@
+import copy
 import logging
 import math
 import os
 import time
+from contextlib import nullcontext
+
 import wandb
 
 import numpy as np
@@ -10,20 +13,97 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from conf_pred import non_conformity_score_diff, non_conformity_score_prop, norm_p_value, calculate_strong_coverage, \
     construct_p_values
 from dataset.ds_meta import DATASET_GETTERS
 from gen_lr_torch import gen_lr
-from train import save_checkpoint, get_cosine_schedule_with_warmup, interleave, de_interleave, create_model, \
-    get_default_arguments, log_metrics_to_file, init_run
+from train import test, save_checkpoint, set_seed, get_cosine_schedule_with_warmup, interleave, de_interleave, \
+    create_model, update_dataset_args, get_default_arguments, log_metrics_to_file, init_device
+from utils.utils import generate_run_uid
 from metrics.misc import AverageMeter, accuracy
 
 from metrics.ece import ece_score, brier_score
 
 logger = logging.getLogger(__name__)
 best_acc = 0
+
+
+def get_calib_non_conf_scores(args, calib_loader, model, non_conf_score_fn):
+    cp_inference_model = copy.deepcopy(model)
+    cp_inference_model = cp_inference_model.to(args.device)
+
+    cp_inference_model.eval()
+
+    calib_acc = AverageMeter()
+
+    with torch.no_grad():
+        non_conf_scores = torch.zeros(len(calib_loader.dataset), device=args.device)
+
+        for idx, (inputs, targets) in enumerate(calib_loader):
+            inputs = inputs.to(args.device)
+            targets = targets.to(args.device)
+
+            preds_logits = cp_inference_model(inputs)
+            preds = torch.softmax(preds_logits / args.T, dim=-1)
+
+            # Calculate non-conformity scores
+            non_conf_scores[idx * (calib_loader.batch_size):(idx + 1) * calib_loader.batch_size] = non_conf_score_fn(
+                preds, targets.int(), args).squeeze()
+
+            calib_acc.update(torch.eq(torch.max(preds_logits, dim=-1).indices.squeeze(),
+                                      targets).float().mean().item(), n=calib_loader.batch_size)
+
+    return non_conf_scores, calib_acc, cp_inference_model
+
+
+def test_cp_metrics(args, test_loader, model, calib_non_conf_scores, non_conf_score_fn):
+    # Strong validity metrics
+    test_strong_validity_005 = AverageMeter()
+    test_strong_validity_01 = AverageMeter()
+    test_strong_validity_025 = AverageMeter()
+
+    # Credal set size
+    test_p_values_mean = AverageMeter()
+
+    if not args.no_progress:
+        test_loader = tqdm(test_loader,
+                           disable=args.local_rank not in [-1, 0])
+
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            model.eval()
+
+            inputs = inputs.to(args.device)
+            targets = targets.to(args.device)
+            # Outputs are the logits
+            outputs = model(inputs)
+
+            # Strong validity
+            outputs_softmax = torch.softmax(outputs.detach() / args.T, dim=-1)
+            p_values = construct_p_values(calib_non_conf_scores, outputs_softmax, non_conf_score_fn, args)
+            norm_p_values = norm_p_value(p_values, variant=args.p_val_norm_var)
+            test_strong_validity_005.update(
+                calculate_strong_coverage(norm_p_values.to(args.device), targets, 0.05).item(),
+                n=norm_p_values.shape[0])
+            test_strong_validity_01.update(
+                calculate_strong_coverage(norm_p_values.to(args.device), targets, 0.1).item(),
+                n=norm_p_values.shape[0])
+            test_strong_validity_025.update(
+                calculate_strong_coverage(norm_p_values.to(args.device), targets, 0.25).item(),
+                n=norm_p_values.shape[0])
+
+            # Credal set size
+            test_p_values_mean.update(norm_p_values.mean().item(), n=norm_p_values.shape[0])
+
+    logger.info("Sval 0.05: {:.2f}".format(test_strong_validity_005.avg))
+    logger.info("Sval 0.1: {:.2f}".format(test_strong_validity_01.avg))
+    logger.info("Sval 0.25: {:.2f}".format(test_strong_validity_025.avg))
+    logger.info("P_val: {:.2f}".format(test_p_values_mean.avg))
+    # logger.info("Class 5: {:.2f}".format(top1_class5.avg))
+    return test_strong_validity_005.avg, test_strong_validity_01.avg, test_strong_validity_025.avg, test_p_values_mean.avg
 
 
 def test_cp(args, test_loader, model, epoch, calib_non_conf_scores, non_conf_score_fn, scoring_pref="test"):
@@ -116,7 +196,8 @@ def test_cp(args, test_loader, model, epoch, calib_non_conf_scores, non_conf_sco
 
     wandb.log({"{}_top1".format(scoring_pref): top1.avg, "{}_top5".format(scoring_pref): top5.avg,
                "{}_loss".format(scoring_pref): losses.avg, "{}_ece".format(scoring_pref): ece.avg,
-               "{}_brier".format(scoring_pref): brier.avg})
+               "{}_brier".format(scoring_pref): brier.avg, })
+    # "{]_class5".format(scoring_pref): top1_class5.avg
 
     logger.info("top-1 acc: {:.2f}".format(top1.avg))
     logger.info("top-5 acc: {:.2f}".format(top5.avg))
@@ -126,8 +207,9 @@ def test_cp(args, test_loader, model, epoch, calib_non_conf_scores, non_conf_sco
     logger.info("Sval 0.1: {:.2f}".format(test_strong_validity_01.avg))
     logger.info("Sval 0.25: {:.2f}".format(test_strong_validity_025.avg))
     logger.info("P_val: {:.2f}".format(test_p_values_mean.avg))
+    # logger.info("Class 5: {:.2f}".format(top1_class5.avg))
     return losses.avg, top1.avg, ece.avg, brier.avg, test_strong_validity_005.avg, test_strong_validity_01.avg, \
-           test_strong_validity_025.avg, test_p_values_mean.avg
+        test_strong_validity_025.avg, test_p_values_mean.avg
 
 
 def main():
@@ -141,11 +223,39 @@ def main():
     parser.add_argument('--p_val_norm_var', type=int, default=0)
     parser.add_argument('--calibration_weak_aug', action='store_true')
     parser.add_argument('--calc_cp_test_stats', default=True, type=bool)
+    parser.add_argument('--calib_update_freq', type=int, default=10)
 
     args = parser.parse_args()
     global best_acc
 
-    args = init_run(args)
+    args.out = args.out + "/" + generate_run_uid(args)
+
+    wandb.init(config=args.__dict__, project=args.wandb_project, sync_tensorboard=True,
+               settings=wandb.Settings(start_method="fork"))
+    args = init_device(args)
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+
+    logger.warning(
+        f"Process rank: {args.local_rank}, "
+        f"device: {args.device}, "
+        f"n_gpu: {args.n_gpu}, "
+        f"distributed training: {bool(args.local_rank != -1)}, "
+        f"16-bits training: {args.amp}", )
+
+    logger.info(dict(args._get_kwargs()))
+
+    if args.seed is not None:
+        set_seed(args)
+
+    if args.local_rank in [-1, 0]:
+        os.makedirs(args.out, exist_ok=True)
+        args.writer = SummaryWriter(args.out)
+
+    update_dataset_args(args)
 
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
@@ -168,8 +278,8 @@ def main():
     calib_loader = DataLoader(
         calib_dataset,
         sampler=SequentialSampler(calib_dataset),
-        batch_size=1,
-        num_workers=args.num_workers)
+        batch_size=64,
+        num_workers=1, shuffle=False)
 
     unlabeled_trainloader = DataLoader(
         unlabeled_dataset,
@@ -227,11 +337,6 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
 
-    if args.amp:
-        from apex import amp
-        model, optimizer = amp.initialize(
-            model, optimizer, opt_level=args.opt_level)
-
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank],
@@ -255,7 +360,8 @@ def main():
 def train(args, labeled_trainloader, calib_loader, unlabeled_trainloader, test_loader,
           model, optimizer, ema_model, scheduler):
     if args.amp:
-        from apex import amp
+        # from apex import amp
+        from torch.cuda import amp
     global best_acc
     test_accs = []
     end = time.time()
@@ -270,12 +376,13 @@ def train(args, labeled_trainloader, calib_loader, unlabeled_trainloader, test_l
     labeled_iter = iter(labeled_trainloader)
     unlabeled_iter = iter(unlabeled_trainloader)
 
-    n_classes = args.num_classes
-
     if args.non_conf_score_variant == 0:
         non_conformity_score = non_conformity_score_diff
     else:
         non_conformity_score = non_conformity_score_prop
+
+    if args.amp:
+        scaler = amp.GradScaler()
 
     model.train()
     for epoch in range(args.start_epoch, args.epochs):
@@ -302,183 +409,207 @@ def train(args, labeled_trainloader, calib_loader, unlabeled_trainloader, test_l
         strong_validity_025 = AverageMeter()
 
         train_sup_acc = AverageMeter()
-        calib_acc = AverageMeter()
 
         # Perform calibration step
-        model.eval()
-        with torch.no_grad():
-            non_conf_scores = torch.zeros(len(calib_loader), device=args.device)
+        non_conf_scores, calib_acc, cp_inference_model = get_calib_non_conf_scores(args, calib_loader, model,
+                                                                                   non_conformity_score)
 
-            for idx, ((inputs_w, inputs_s), targets) in enumerate(calib_loader):
-                if not args.calibration_weak_aug:
-                    inputs = inputs_s
-                else:
-                    inputs = inputs_w
+        # Evaluate CP-related statics BEFORE training
+        if args.local_rank in [-1, 0] and args.calc_cp_test_stats:
+            if args.use_ema:
+                test_model = ema_model.ema
+            else:
+                test_model = model
 
-                inputs = inputs.to(args.device)
-                targets = targets.to(args.device)
+            scoring_pref = "test"
+            if args.validation_scoring:
+                scoring_pref = "val"
+            test_sval005, test_sval01, test_sval025, test_p_vals = test_cp_metrics(
+                args,
+                test_loader,
+                test_model,
+                non_conf_scores,
+                non_conformity_score)
 
-                preds_logits = model(inputs)
-                preds = torch.softmax(preds_logits / args.T, dim=-1)
+            # Calculate test strong validity
+            args.writer.add_scalar('{}/cpcorr_{}_sval_005'.format(scoring_pref, scoring_pref), test_sval005, epoch)
+            args.writer.add_scalar('{}/cpcorr_{}_sval_01'.format(scoring_pref, scoring_pref), test_sval01, epoch)
+            args.writer.add_scalar('{}/cpcorr_{}_sval_025'.format(scoring_pref, scoring_pref), test_sval025, epoch)
+            args.writer.add_scalar('{}/cpcorr_{}_p_val'.format(scoring_pref, scoring_pref), test_p_vals, epoch)
 
-                # Calculate non-conformity scores
-                non_conf_scores[idx] = non_conformity_score(preds, targets.int(), args).squeeze()
-
-                calib_acc.update(torch.eq(torch.max(preds_logits, dim=-1).indices.squeeze(),
-                                          targets).float().mean().item(), n=calib_loader.batch_size)
-            # print("Non conf scores:", non_conf_scores)
-
-        model.train()
+        # model.train()
 
         if not args.no_progress:
             p_bar = tqdm(range(args.eval_step),
                          disable=args.local_rank not in [-1, 0])
         for batch_idx in range(args.eval_step):
-            try:
-                inputs_x, targets_x = labeled_iter.next()
-            except:
-                if args.world_size > 1:
-                    labeled_epoch += 1
-                    labeled_trainloader.sampler.set_epoch(labeled_epoch)
-                labeled_iter = iter(labeled_trainloader)
-                inputs_x, targets_x = labeled_iter.next()
+            with amp.autocast() if args.amp else nullcontext():
+                # Update calibration scores for an update uncertainty quantification
+                if (batch_idx + 1) % args.calib_update_freq == 0:
+                    non_conf_scores, _, cp_inference_model = get_calib_non_conf_scores(args, calib_loader,
+                                                                                       model, non_conformity_score)
 
-            # Targets are only used to report debugging stats
-            try:
-                (inputs_u_w, inputs_u_s), targets_u = unlabeled_iter.next()
-            except:
-                if args.world_size > 1:
-                    unlabeled_epoch += 1
-                    unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
-                unlabeled_iter = iter(unlabeled_trainloader)
-                (inputs_u_w, inputs_u_s), targets_u = unlabeled_iter.next()
+                try:
+                    inputs_x, targets_x = next(labeled_iter)
+                except:
+                    if args.world_size > 1:
+                        labeled_epoch += 1
+                        labeled_trainloader.sampler.set_epoch(labeled_epoch)
+                    labeled_iter = iter(labeled_trainloader)
+                    inputs_x, targets_x = next(labeled_iter)
 
-            data_time.update(time.time() - end)
-            batch_size = inputs_x.shape[0]
-            inputs = interleave(torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
-            targets_x = targets_x.to(args.device)
-            logits = model(inputs)
-            logits = de_interleave(logits, 2 * args.mu + 1)
-            logits_x = logits[:batch_size]
+                # Targets are only used to report debugging stats
+                try:
+                    (inputs_u_w, inputs_u_s), targets_u = next(unlabeled_iter)
+                except:
+                    if args.world_size > 1:
+                        unlabeled_epoch += 1
+                        unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
+                    unlabeled_iter = iter(unlabeled_trainloader)
+                    (inputs_u_w, inputs_u_s), targets_u = next(unlabeled_iter)
 
-            train_sup_acc.update(torch.eq(torch.max(logits_x, dim=-1).indices, targets_x).float().mean().item(),
-                                 n=logits_x.shape[0])
-            logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
-            del logits
+                data_time.update(time.time() - end)
+                batch_size = inputs_x.shape[0]
+                # inputs = interleave(torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+                inputs = interleave(torch.cat((inputs_x, inputs_u_s)), args.mu + 1).to(args.device)
+                targets_x = targets_x.to(args.device)
+                logits = model(inputs)
+                # logits = de_interleave(logits, 2 * args.mu + 1)
+                logits = de_interleave(logits, args.mu + 1)
+                logits_x = logits[:batch_size]
 
-            # Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
-            with torch.no_grad():
-                one_hot_targets = F.one_hot(targets_x.type(torch.int64), num_classes=args.num_classes).float()
-            preds_x = torch.softmax(logits_x / args.T, dim=-1)
+                train_sup_acc.update(torch.eq(torch.max(logits_x, dim=-1).indices, targets_x).float().mean().item(),
+                                     n=logits_x.shape[0])
+                # logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                logits_u_s = logits[batch_size:]
+                del logits
 
-            preds_x = torch.clip(preds_x, 1e-5, 1.)
-            one_hot_targets = torch.clip(one_hot_targets, 1e-5, 1.)
+                # Derive logits_u_w
+                inputs_u_w = inputs_u_w.to(args.device)
+                logits_u_w = cp_inference_model(inputs_u_w)
 
-            Lx = F.kl_div(preds_x.log(), one_hot_targets, log_target=False, reduction='batchmean')
+                # Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
+                with torch.no_grad():
+                    one_hot_targets = F.one_hot(targets_x.type(torch.int64), num_classes=args.num_classes).float()
+                preds_x = torch.softmax(logits_x / args.T, dim=-1)
 
-            # Unsupervised part
-            with torch.no_grad():
-                pseudo_label_w = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+                preds_x = torch.clip(preds_x, 1e-5, 1.)
+                one_hot_targets = torch.clip(one_hot_targets, 1e-5, 1.)
 
-                p_values = construct_p_values(non_conf_scores, pseudo_label_w, non_conformity_score, args)
+                Lx = F.kl_div(preds_x.log(), one_hot_targets, log_target=False, reduction='batchmean')
 
-                norm_p_values = norm_p_value(p_values, variant=args.p_val_norm_var)
+                # Unsupervised part
+                with torch.no_grad():
+                    pseudo_label_w = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
 
-                # norm_p_values_entropy = torch.distributions.Categorical(norm_p_values).entropy().mean()
-                norm_p_values_mean = norm_p_values.mean()
-                p_values_mean.update(norm_p_values_mean.item(), n=norm_p_values.shape[0])
+                    p_values = construct_p_values(non_conf_scores, pseudo_label_w, non_conformity_score, args)
+                    # print("p_values:", p_values.mean())
 
-                # Question: Is the largest p value also the u_pred?
-                # print("Largest p=:", torch.max(norm_p_values, dim=-1).indices.to(args.device) == u_pred.to(args.device))
-                preds_u_w = torch.max(pseudo_label_w, dim=-1).indices.to(args.device)
-                preds_u_p = torch.max(norm_p_values, dim=-1).indices.to(args.device)
-                targets_u = targets_u.to(args.device)
+                    norm_p_values = norm_p_value(p_values, variant=args.p_val_norm_var)
+                    # print("norm p_values:", norm_p_values.mean())
 
-                acc_u_w_tmp = torch.mean(torch.eq(preds_u_w, targets_u).float())
-                acc_u_p_tmp = torch.mean(torch.eq(preds_u_p, targets_u).float())
+                    # norm_p_values_entropy = torch.distributions.Categorical(norm_p_values).entropy().mean()
+                    norm_p_values_mean = norm_p_values.mean()
+                    p_values_mean.update(norm_p_values_mean.item(), n=norm_p_values.shape[0])
 
-                acc_u_w.update(acc_u_w_tmp.item(), n=preds_u_w.shape[0])
-                acc_u_p.update(acc_u_p_tmp.item(), n=preds_u_p.shape[0])
+                    # Question: Is the largest p value also the u_pred?
+                    # print("Largest p=:", torch.max(norm_p_values, dim=-1).indices.to(args.device) == u_pred.to(args.device))
+                    preds_u_w = torch.max(pseudo_label_w, dim=-1).indices.to(args.device)
+                    preds_u_p = torch.max(norm_p_values, dim=-1).indices.to(args.device)
+                    targets_u = targets_u.to(args.device)
 
-                conf_u_w.update(torch.mean(torch.max(pseudo_label_w, dim=-1).values), n=preds_u_w.shape[0])
-                conf_u_w_min.update(torch.mean(torch.min(pseudo_label_w, dim=-1).values), n=preds_u_w.shape[0])
+                    acc_u_w_tmp = torch.mean(torch.eq(preds_u_w, targets_u).float())
+                    acc_u_p_tmp = torch.mean(torch.eq(preds_u_p, targets_u).float())
 
-            pseudo_label_s = torch.softmax(logits_u_s / args.T, dim=-1)
-            with torch.no_grad():
-                preds_u_s = torch.max(pseudo_label_s, dim=-1).indices.to(args.device)
-                acc_u_s_tmp = torch.mean(torch.eq(preds_u_s, targets_u).float())
-                acc_u_s.update(acc_u_s_tmp.item(), n=preds_u_s.shape[0])
+                    acc_u_w.update(acc_u_w_tmp.item(), n=preds_u_w.shape[0])
+                    acc_u_p.update(acc_u_p_tmp.item(), n=preds_u_p.shape[0])
 
-                conf_u_s.update(torch.mean(torch.max(pseudo_label_s, dim=-1).values), n=preds_u_s.shape[0])
-                conf_u_s_min.update(torch.mean(torch.min(pseudo_label_s, dim=-1).values), n=preds_u_s.shape[0])
+                    conf_u_w.update(torch.mean(torch.max(pseudo_label_w, dim=-1).values), n=preds_u_w.shape[0])
+                    conf_u_w_min.update(torch.mean(torch.min(pseudo_label_w, dim=-1).values), n=preds_u_w.shape[0])
 
-                strong_validity_005.update(
-                    calculate_strong_coverage(norm_p_values.to(args.device), targets_u, 0.05).item(),
-                    n=norm_p_values.shape[0])
-                strong_validity_01.update(
-                    calculate_strong_coverage(norm_p_values.to(args.device), targets_u, 0.1).item(),
-                    n=norm_p_values.shape[0])
-                strong_validity_025.update(
-                    calculate_strong_coverage(norm_p_values.to(args.device), targets_u, 0.25).item(),
-                    n=norm_p_values.shape[0])
+                pseudo_label_s = torch.softmax(logits_u_s / args.T, dim=-1)
+                with torch.no_grad():
+                    preds_u_s = torch.max(pseudo_label_s, dim=-1).indices.to(args.device)
+                    acc_u_s_tmp = torch.mean(torch.eq(preds_u_s, targets_u).float())
+                    acc_u_s.update(acc_u_s_tmp.item(), n=preds_u_s.shape[0])
 
-            # Execute on CPU as this is faster at the moment
-            Lu = gen_lr(pseudo_label_s.to("cpu"), norm_p_values.to("cpu")).to(args.device)
+                    conf_u_s.update(torch.mean(torch.max(pseudo_label_s, dim=-1).values), n=preds_u_s.shape[0])
+                    conf_u_s_min.update(torch.mean(torch.min(pseudo_label_s, dim=-1).values), n=preds_u_s.shape[0])
 
-            mask = torch.ones(pseudo_label_w.shape[0]).to(args.device)
+                    strong_validity_005.update(
+                        calculate_strong_coverage(norm_p_values.to(args.device), targets_u, 0.05).item(),
+                        n=norm_p_values.shape[0])
+                    strong_validity_01.update(
+                        calculate_strong_coverage(norm_p_values.to(args.device), targets_u, 0.1).item(),
+                        n=norm_p_values.shape[0])
+                    strong_validity_025.update(
+                        calculate_strong_coverage(norm_p_values.to(args.device), targets_u, 0.25).item(),
+                        n=norm_p_values.shape[0])
 
-            loss = Lx + args.lambda_u * Lu
+                # Execute on CPU as this is faster at the moment
+                Lu = gen_lr(pseudo_label_s.float().to("cpu"), norm_p_values.float().to("cpu")).to(args.device)
+                # Lu = gen_lr(pseudo_label_s.to("cuda:0"), norm_p_values.to("cuda:0")).to(args.device)
 
-            if args.amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+                mask = torch.ones(pseudo_label_w.shape[0]).to(args.device)
 
-            losses.update(loss.item())
-            losses_x.update(Lx.item())
-            losses_u.update(Lu.item())
+                loss = Lx + args.lambda_u * Lu
 
-            optimizer.step()
-            scheduler.step()
-            if args.use_ema:
-                ema_model.update(model)
-            model.zero_grad()
+                if args.amp:
+                    # with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    #     scaled_loss.backward()
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
-            batch_time.update(time.time() - end)
-            end = time.time()
-            mask_probs.update(mask.mean().item())
-            if not args.no_progress:
-                p_bar.set_description(
-                    "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. "
-                    "Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. "
-                    "Mask: {mask:.2f}. P val: {p_val:.2f}. u_acc (w/s/p): ({acc_u_w:.2f}/{acc_u_s:.2f}/{acc_u_p:.2f}). "
-                    "Conf_u_w (max/min): {conf_u_w:.2f}/{conf_u_w_min:.2f}. "
-                    "Conf_u_s (max/min): {conf_u_s:.2f}/{conf_u_s_min:.2f}. "
-                    "Acc train (sup): {train_acc:.2f}. Acc calib: {calib_acc:.2f}.".format(
-                        epoch=epoch + 1,
-                        epochs=args.epochs,
-                        batch=batch_idx + 1,
-                        iter=args.eval_step,
-                        lr=scheduler.get_last_lr()[0],
-                        data=data_time.avg,
-                        bt=batch_time.avg,
-                        loss=losses.avg,
-                        loss_x=losses_x.avg,
-                        loss_u=losses_u.avg,
-                        p_val=p_values_mean.avg,
-                        mask=mask_probs.avg,
-                        acc_u_w=acc_u_w.avg,
-                        acc_u_s=acc_u_s.avg,
-                        acc_u_p=acc_u_p.avg,
-                        conf_u_w=conf_u_w.avg,
-                        conf_u_w_min=conf_u_w_min.avg,
-                        conf_u_s=conf_u_s.avg,
-                        conf_u_s_min=conf_u_s_min.avg,
-                        train_acc=train_sup_acc.avg,
-                        calib_acc=calib_acc.avg
-                    ))
-                p_bar.update()
+                losses.update(loss.item())
+                losses_x.update(Lx.item())
+                losses_u.update(Lu.item())
+
+                if args.amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                scheduler.step()
+                if args.use_ema:
+                    ema_model.update(model)
+                model.zero_grad()
+
+                batch_time.update(time.time() - end)
+                end = time.time()
+                mask_probs.update(mask.mean().item())
+                if not args.no_progress:
+                    p_bar.set_description(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. "
+                        "Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. "
+                        "Mask: {mask:.2f}. P val: {p_val:.2f}. u_acc (w/s/p): ({acc_u_w:.2f}/{acc_u_s:.2f}/{acc_u_p:.2f}). "
+                        "Conf_u_w (max/min): {conf_u_w:.2f}/{conf_u_w_min:.2f}. "
+                        "Conf_u_s (max/min): {conf_u_s:.2f}/{conf_u_s_min:.2f}. "
+                        "Acc train (sup): {train_acc:.2f}. Acc calib: {calib_acc:.2f}.".format(
+                            epoch=epoch + 1,
+                            epochs=args.epochs,
+                            batch=batch_idx + 1,
+                            iter=args.eval_step,
+                            lr=scheduler.get_last_lr()[0],
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            loss=losses.avg,
+                            loss_x=losses_x.avg,
+                            loss_u=losses_u.avg,
+                            p_val=p_values_mean.avg,
+                            mask=mask_probs.avg,
+                            acc_u_w=acc_u_w.avg,
+                            acc_u_s=acc_u_s.avg,
+                            acc_u_p=acc_u_p.avg,
+                            conf_u_w=conf_u_w.avg,
+                            conf_u_w_min=conf_u_w_min.avg,
+                            conf_u_s=conf_u_s.avg,
+                            conf_u_s_min=conf_u_s_min.avg,
+                            train_acc=train_sup_acc.avg,
+                            calib_acc=calib_acc.avg
+                        ))
+                    p_bar.update()
 
         if not args.no_progress:
             p_bar.close()

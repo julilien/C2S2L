@@ -6,7 +6,7 @@ from torchvision import transforms
 from .randaugment import RandAugmentMC
 
 
-def x_u_split(args, labels, use_validation=False, val_fraction=0.2):
+def x_u_split(args, labels, use_validation=False, val_fraction=0.2, excl_labeled_in_unlabeled=False):
     label_per_class = args.num_labeled // args.num_classes
 
     labels = np.array(labels)
@@ -22,20 +22,23 @@ def x_u_split(args, labels, use_validation=False, val_fraction=0.2):
     else:
         val_idx = None
 
-    # unlabeled data: all data (https://github.com/kekmodel/FixMatch-pytorch/issues/10)
-    unlabeled_idx = np.array(range(len(labels)))
     for i in range(args.num_classes):
         idx = np.where(labels == i)[0]
         if use_validation:
-            complete_idx = np.random.choice(idx, label_per_class + val_label_per_class, False)
+            complete_idx = np.random.choice(idx, min(label_per_class + val_label_per_class, len(labels[labels == i])), False)
             tmp_val_idx = complete_idx[label_per_class:]
             val_idx.extend(tmp_val_idx)
             idx = complete_idx[:label_per_class]
         else:
-            idx = np.random.choice(idx, label_per_class, False)
+            idx = np.random.choice(idx, min(label_per_class, len(labels[labels == i])), False)
         labeled_idx.extend(idx)
     labeled_idx = np.array(labeled_idx)
-    assert len(labeled_idx) == args.num_labeled
+    # assert len(labeled_idx) == args.num_labeled
+
+    # unlabeled data: all data (https://github.com/kekmodel/FixMatch-pytorch/issues/10)
+    unlabeled_idx = np.array(range(len(labels)))
+    if excl_labeled_in_unlabeled:
+        unlabeled_idx = unlabeled_idx[~np.isin(unlabeled_idx, labeled_idx)]
 
     if args.expand_labels or args.num_labeled < args.batch_size:
         num_expand_x = math.ceil(

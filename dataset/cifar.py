@@ -7,6 +7,7 @@ from torchvision import transforms
 import torch
 
 from dataset.ds_utils import TransformFixMatch, x_u_split
+from dataset.imbalance import get_img_num_per_cls, imbalance_cifar
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ def get_cifar10(args, root, return_idxs=False):
     ])
     base_dataset = datasets.CIFAR10(root, train=True, download=True)
 
+    if args.imbalanced:
+        base_dataset = imbalance_cifar(base_dataset, 10, args.imbalance_factor, args.seed)
+
     train_labeled_idxs, train_unlabeled_idxs, val_idxs = x_u_split(
         args, base_dataset.targets, use_validation=args.validation_scoring)
 
@@ -52,7 +56,9 @@ def get_cifar10(args, root, return_idxs=False):
         # Apply same transform as for the weak part
         calib_idxs = np.unique(calib_idxs)
         calib_dataset = CIFAR10SSL(root, calib_idxs, train=True,
-                                   transform=TransformFixMatch(mean=cifar10_mean, std=cifar10_std))
+                                   # transform=TransformFixMatch(mean=cifar10_mean, std=cifar10_std)
+                                   transform=transform_val
+                                   )
 
     train_labeled_dataset = CIFAR10SSL(
         root, train_labeled_idxs, train=True,
@@ -91,6 +97,9 @@ def get_cifar100(args, root, return_idxs=False):
     base_dataset = datasets.CIFAR100(
         root, train=True, download=True)
 
+    if args.imbalanced:
+        base_dataset = imbalance_cifar(base_dataset, 100, args.imbalance_factor, args.seed)
+
     train_labeled_idxs, train_unlabeled_idxs, val_idxs = x_u_split(args, base_dataset.targets,
                                                                    use_validation=args.validation_scoring)
 
@@ -106,9 +115,12 @@ def get_cifar100(args, root, return_idxs=False):
         calib_idxs = train_labeled_idxs[:num_calib_instances]
         train_labeled_idxs = train_labeled_idxs[num_calib_instances:]
 
-        calib_dataset = CIFAR10SSL(
-            root, calib_idxs, train=True,
-            transform=TransformFixMatch(mean=cifar100_mean, std=cifar100_std))
+        # Apply same transform as for the weak part
+        calib_idxs = np.unique(calib_idxs)
+        calib_dataset = CIFAR100SSL(root, calib_idxs, train=True,
+                                   # transform=TransformFixMatch(mean=cifar10_mean, std=cifar10_std)
+                                   transform=transform_val
+                                   )
 
     train_labeled_dataset = CIFAR100SSL(
         root, train_labeled_idxs, train=True,

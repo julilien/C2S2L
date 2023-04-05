@@ -9,9 +9,6 @@ import shutil
 
 from .ds_utils import TransformFixMatch, x_u_split
 
-# TODO: We need to load the data on-the-fly
-
-# TODO: Check this
 tiny_imagenet_mean = (0.4914, 0.4822, 0.4465)
 tiny_imagenet_std = (0.2023, 0.1994, 0.2010)
 

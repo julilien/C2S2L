@@ -18,9 +18,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset.ds_meta import DATASET_GETTERS
+from dataset.emnist import NUM_EMNIST_CLASSES
 from metrics.ece import ece_score, brier_score
 from utils.utils import generate_run_uid
 from metrics.misc import AverageMeter, accuracy
+from contextlib import nullcontext
 
 logger = logging.getLogger(__name__)
 best_acc = 0
@@ -71,10 +73,10 @@ def get_default_arguments():
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
     parser.add_argument('--gpu-id', default='0', type=int,
                         help='id(s) for CUDA_VISIBLE_DEVICES')
-    parser.add_argument('--num-workers', type=int, default=2,
+    parser.add_argument('--num-workers', type=int, default=8,
                         help='number of workers')
     parser.add_argument('--dataset', default='cifar10', type=str,
-                        choices=['cifar10', 'cifar100', 'svhn', 'stl10', 'tinyimagenet', 'svhn_extra'],
+                        choices=['cifar10', 'cifar100', 'svhn', 'stl10', 'tinyimagenet', 'svhn_extra', 'emnist'],
                         help='dataset name')
     parser.add_argument('--num-labeled', type=int, default=4000,
                         help='number of labeled data')
@@ -130,6 +132,10 @@ def get_default_arguments():
 
     parser.add_argument('--dataset_dir', type=str, default="./data")
     parser.add_argument('--wandb_project', type=str, default="CCSSL")
+
+    # Imbalance args
+    parser.add_argument('--imbalanced', action="store_true", default=False)
+    parser.add_argument('--imbalance_factor', type=float, default=20)
 
     return parser
 
@@ -192,6 +198,16 @@ def update_dataset_args(args):
             args.model_cardinality = 8
             args.model_depth = 29
             args.model_width = 64
+    elif args.dataset == 'emnist':
+        # args.num_classes = 26
+        args.num_classes = NUM_EMNIST_CLASSES
+        if args.arch == 'wideresnet':
+            args.model_depth = 28
+            args.model_width = 2
+        elif args.arch == 'resnext':
+            args.model_cardinality = 4
+            args.model_depth = 28
+            args.model_width = 4
     else:
         raise ValueError("Unrecognized dataset {}...".format(args.dataset))
 
@@ -216,10 +232,17 @@ def init_device(args):
     return args
 
 
-def init_run(args):
+def main():
+    parser = get_default_arguments()
+    parser.add_argument('--da', default=False, type=bool, help="Distribution alignment")
+
+    args = parser.parse_args()
+    global best_acc
+
     args.out = args.out + "/" + generate_run_uid(args)
 
-    wandb.init(config=args.__dict__, project=args.wandb_project, sync_tensorboard=True)
+    wandb.init(config=args.__dict__, project=args.wandb_project, sync_tensorboard=True,
+               settings=wandb.Settings(start_method="fork"))
     args = init_device(args)
 
     logging.basicConfig(
@@ -245,17 +268,6 @@ def init_run(args):
 
     update_dataset_args(args)
 
-    return args
-
-
-def main():
-    parser = get_default_arguments()
-    parser.add_argument('--da', default=False, type=bool, help="Distribution alignment")
-
-    args = parser.parse_args()
-    global best_acc
-
-    args = init_run(args)
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
@@ -331,11 +343,6 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
 
-    if args.amp:
-        from apex import amp
-        model, optimizer = amp.initialize(
-            model, optimizer, opt_level=args.opt_level)
-
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank],
@@ -373,7 +380,8 @@ def log_metrics_to_file(args, epoch, test_acc, test_ece, test_brier, scoring_pre
 def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
           model, optimizer, ema_model, scheduler, p_data):
     if args.amp:
-        from apex import amp
+        from torch.cuda import amp
+
     global best_acc
     test_accs = []
     end = time.time()
@@ -393,6 +401,9 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                                      requires_grad=False) / args.num_classes
         p_data = p_data.detach()
 
+    if args.amp:
+        scaler = amp.GradScaler()
+
     model.train()
     for epoch in range(args.start_epoch, args.epochs):
         batch_time = AverageMeter()
@@ -410,116 +421,121 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             p_bar = tqdm(range(args.eval_step),
                          disable=args.local_rank not in [-1, 0])
         for batch_idx in range(args.eval_step):
-            try:
-                inputs_x, targets_x = labeled_iter.next()
-            except:
-                if args.world_size > 1:
-                    labeled_epoch += 1
-                    labeled_trainloader.sampler.set_epoch(labeled_epoch)
-                labeled_iter = iter(labeled_trainloader)
-                inputs_x, targets_x = labeled_iter.next()
+            with amp.autocast() if args.amp else nullcontext():
+                try:
+                    inputs_x, targets_x = next(labeled_iter)
+                except:
+                    if args.world_size > 1:
+                        labeled_epoch += 1
+                        labeled_trainloader.sampler.set_epoch(labeled_epoch)
+                    labeled_iter = iter(labeled_trainloader)
+                    inputs_x, targets_x = next(labeled_iter)
 
-            # Targets are only used to report debugging stats
-            try:
-                (inputs_u_w, inputs_u_s), targets_u_orig = unlabeled_iter.next()
-            except:
-                if args.world_size > 1:
-                    unlabeled_epoch += 1
-                    unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
-                unlabeled_iter = iter(unlabeled_trainloader)
-                (inputs_u_w, inputs_u_s), targets_u_orig = unlabeled_iter.next()
+                # Targets are only used to report debugging stats
+                try:
+                    (inputs_u_w, inputs_u_s), targets_u_orig = next(unlabeled_iter)
+                except:
+                    if args.world_size > 1:
+                        unlabeled_epoch += 1
+                        unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
+                    unlabeled_iter = iter(unlabeled_trainloader)
+                    (inputs_u_w, inputs_u_s), targets_u_orig = next(unlabeled_iter)
 
-            data_time.update(time.time() - end)
-            batch_size = inputs_x.shape[0]
-            inputs = interleave(
-                torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
-            targets_x = targets_x.to(args.device)
-            logits = model(inputs)
-            logits = de_interleave(logits, 2 * args.mu + 1)
-            logits_x = logits[:batch_size]
-            logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
-            del logits
+                data_time.update(time.time() - end)
+                batch_size = inputs_x.shape[0]
+                inputs = interleave(
+                    torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+                targets_x = targets_x.to(args.device)
+                logits = model(inputs)
+                logits = de_interleave(logits, 2 * args.mu + 1)
+                logits_x = logits[:batch_size]
+                logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                del logits
 
-            Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
+                Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
 
-            pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
-            if not args.da:
-                max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-            else:
-                # Determine p_data and p_model for target normalization
-                p_model = p_model_mov_avg.mean(axis=0)
-                p_model /= p_model.sum()
+                pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+                if not args.da:
+                    max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+                else:
+                    # Determine p_data and p_model for target normalization
+                    p_model = p_model_mov_avg.mean(axis=0)
+                    p_model /= p_model.sum()
 
-                guess = pseudo_label * (p_data.to(args.device) + 1e-6) / (p_model.to(args.device) + 1e-6)
-                guess /= torch.sum(guess, dim=1, keepdim=True)
-                max_probs, targets_u = torch.max(guess, dim=-1)
+                    guess = pseudo_label * (p_data.to(args.device) + 1e-6) / (p_model.to(args.device) + 1e-6)
+                    guess /= torch.sum(guess, dim=1, keepdim=True)
+                    max_probs, targets_u = torch.max(guess, dim=-1)
 
-            mask = max_probs.ge(args.threshold).float()
+                mask = max_probs.ge(args.threshold).float()
 
-            targets_u = targets_u.to(args.device)
-            targets_u_orig = targets_u_orig.to(args.device)
+                targets_u = targets_u.to(args.device)
+                targets_u_orig = targets_u_orig.to(args.device)
 
-            with torch.no_grad():
-                preds_u_w = torch.max(logits_u_w, dim=-1).indices.to(args.device)
-                preds_u_s = torch.max(logits_u_s, dim=-1).indices.to(args.device)
-
-                acc_u_w_tmp = torch.mean(torch.eq(preds_u_w, targets_u_orig).float())
-                acc_u_s_tmp = torch.mean(torch.eq(preds_u_s, targets_u_orig).float())
-                acc_u_s_masked_tmp = torch.sum(torch.eq(preds_u_s, targets_u_orig).float() * mask) / torch.sum(mask)
-
-            Lu = (F.cross_entropy(logits_u_s, targets_u,
-                                  reduction='none') * mask).mean()
-
-            loss = Lx + args.lambda_u * Lu
-
-            if args.amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
-
-            losses.update(loss.item())
-            losses_x.update(Lx.item())
-            losses_u.update(Lu.item())
-            acc_u_w.update(acc_u_w_tmp.item())
-            acc_u_s.update(acc_u_s_tmp.item())
-            acc_u_s_masked.update(acc_u_s_masked_tmp.item())
-
-            optimizer.step()
-            scheduler.step()
-            if args.use_ema:
-                ema_model.update(model)
-            model.zero_grad()
-
-            # Update p_model_mov_avg by preds_u_w
-            if args.da:
                 with torch.no_grad():
-                    preds_u_w_avg = pseudo_label.float().mean(dim=0).to(args.device)
-                    p_model_mov_avg = torch.cat((p_model_mov_avg[1:], preds_u_w_avg.unsqueeze(0)), dim=0)
+                    preds_u_w = torch.max(logits_u_w, dim=-1).indices.to(args.device)
+                    preds_u_s = torch.max(logits_u_s, dim=-1).indices.to(args.device)
 
-            batch_time.update(time.time() - end)
-            end = time.time()
-            mask_probs.update(mask.mean().item())
-            if not args.no_progress:
-                p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. "
-                                      "Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. "
-                                      "Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. "
-                                      "u_acc (w/s/m): ({acc_u_w:.2f}/{acc_u_s:.2f}/{acc_u_s_masked:.2f}).".format(
-                    epoch=epoch + 1,
-                    epochs=args.epochs,
-                    batch=batch_idx + 1,
-                    iter=args.eval_step,
-                    lr=scheduler.get_last_lr()[0],
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    loss=losses.avg,
-                    loss_x=losses_x.avg,
-                    loss_u=losses_u.avg,
-                    mask=mask_probs.avg,
-                    acc_u_w=acc_u_w.avg,
-                    acc_u_s=acc_u_s.avg,
-                    acc_u_s_masked=acc_u_s_masked.avg))
-                p_bar.update()
+                    acc_u_w_tmp = torch.mean(torch.eq(preds_u_w, targets_u_orig).float())
+                    acc_u_s_tmp = torch.mean(torch.eq(preds_u_s, targets_u_orig).float())
+                    acc_u_s_masked_tmp = torch.sum(torch.eq(preds_u_s, targets_u_orig).float() * mask) / torch.sum(mask)
+
+                Lu = (F.cross_entropy(logits_u_s, targets_u,
+                                      reduction='none') * mask).mean()
+
+                loss = Lx + args.lambda_u * Lu
+
+                if args.amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                losses.update(loss.item())
+                losses_x.update(Lx.item())
+                losses_u.update(Lu.item())
+                acc_u_w.update(acc_u_w_tmp.item())
+                acc_u_s.update(acc_u_s_tmp.item())
+                acc_u_s_masked.update(acc_u_s_masked_tmp.item())
+
+                if args.amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                scheduler.step()
+                if args.use_ema:
+                    ema_model.update(model)
+                model.zero_grad()
+
+                # Update p_model_mov_avg by preds_u_w
+                if args.da:
+                    with torch.no_grad():
+                        preds_u_w_avg = pseudo_label.float().mean(dim=0).to(args.device)
+                        p_model_mov_avg = torch.cat((p_model_mov_avg[1:], preds_u_w_avg.unsqueeze(0)), dim=0)
+
+                batch_time.update(time.time() - end)
+                end = time.time()
+                mask_probs.update(mask.mean().item())
+                if not args.no_progress:
+                    p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. "
+                                          "Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. "
+                                          "Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. "
+                                          "u_acc (w/s/m): ({acc_u_w:.2f}/{acc_u_s:.2f}/{acc_u_s_masked:.2f}).".format(
+                        epoch=epoch + 1,
+                        epochs=args.epochs,
+                        batch=batch_idx + 1,
+                        iter=args.eval_step,
+                        lr=scheduler.get_last_lr()[0],
+                        data=data_time.avg,
+                        bt=batch_time.avg,
+                        loss=losses.avg,
+                        loss_x=losses_x.avg,
+                        loss_u=losses_u.avg,
+                        mask=mask_probs.avg,
+                        acc_u_w=acc_u_w.avg,
+                        acc_u_s=acc_u_s.avg,
+                        acc_u_s_masked=acc_u_s_masked.avg))
+                    p_bar.update()
 
         if not args.no_progress:
             p_bar.close()
