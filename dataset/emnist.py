@@ -38,18 +38,6 @@ def get_emnist(args, root, return_idxs=False):
     train_labeled_idxs, train_unlabeled_idxs, val_idxs = x_u_split(
         args, base_dataset.targets, use_validation=args.validation_scoring)
 
-    # # TODO: Repeat some instances in the labeled data
-    # # train_labeled_idxs
-    # # TODO: Less dogs
-    # unique_train_labels = np.unique(train_labeled_idxs)
-    # dog_mask = np.array(base_dataset.targets)[np.unique(train_labeled_idxs)] == 5
-    # dog_indices = unique_train_labels[dog_mask]
-    # np.random.seed(args.seed)
-    # np.random.shuffle(dog_indices)
-    # keep_dogs = dog_indices[:10]
-    # train_labeled_idxs = np.where(np.array(base_dataset.targets)[train_labeled_idxs] == 5,
-    #                               np.random.choice(keep_dogs, len(train_labeled_idxs)), train_labeled_idxs)
-
     # Get dataset stats
     target_tensor = torch.Tensor(np.array(base_dataset.targets)[train_labeled_idxs]).int()
     bin_counts = torch.bincount(target_tensor)
@@ -60,7 +48,6 @@ def get_emnist(args, root, return_idxs=False):
         np.random.seed(args.seed)
         np.random.shuffle(train_labeled_idxs)
 
-        # TODO
         unique_instances = np.unique(train_labeled_idxs)
         num_calib_instances = int(args.calibration_split * len(unique_instances))
         np.random.shuffle(unique_instances)
