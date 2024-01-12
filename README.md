@@ -3,16 +3,22 @@
 This repository contains an implementation of _Conformal Credal Self-Supervised Learning_ (C^2S^2L). Please cite this work as follows:
 
 ```
-@article{DBLP:journals/corr/abs-2205-15239,
-  author    = {Julian Lienen and
-               Caglar Demir and
-               Eyke H{\"{u}}llermeier},
-  title     = {Conformal Credal Self-Supervised Learning},
-  journal   = {CoRR},
-  volume    = {abs/2205.15239},
-  year      = {2022},
-  url       = {https://doi.org/10.48550/arXiv.2205.15239},
-  doi       = {10.48550/arXiv.2205.15239}
+@inproceedings{DBLP:conf/copa/LienenDH23,
+  author       = {Julian Lienen and
+                  Caglar Demir and
+                  Eyke H{\"{u}}llermeier},
+  editor       = {Harris Papadopoulos and
+                  Khuong An Nguyen and
+                  Henrik Bostr{\"{o}}m and
+                  Lars Carlsson},
+  title        = {Conformal Credal Self-Supervised Learning},
+  booktitle    = {Conformal and Probabilistic Prediction with Applications, 13-15 September
+                  2023, Limassol, Cyprus},
+  series       = {Proceedings of Machine Learning Research},
+  volume       = {204},
+  pages        = {214--233},
+  publisher    = {{PMLR}},
+  year         = {2023}
 }
 ```
 
